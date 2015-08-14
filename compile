@@ -1,1 +1,6 @@
-gcc -Iinc/ src/*.c
+#!/bin/bash
+shopt -s extglob
+cd build 
+gcc -c -I../inc/ ../src/*.c
+gcc -o ../bare !(virtual*).o virtual_pkt_fwd.o
+gcc -o ../gps  !(virtual*).o virtual_gps_pkt_fwd.o

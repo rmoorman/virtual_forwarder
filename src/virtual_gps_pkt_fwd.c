@@ -8,6 +8,7 @@
 
 Description:
 	Configure Lora concentrator and forward packets to a server
+	Use GPS for packet timestamping.
 
 License: Revised BSD License, see LICENSE.TXT file include in the project
 Maintainer: Sylvain Miermont
@@ -29,6 +30,7 @@ Maintainer: Sylvain Miermont
 #include <unistd.h>		/* getopt, access */
 #include <stdlib.h>		/* atoi, exit */
 #include <errno.h>		/* error messages */
+#include <math.h>		/* modf */
 
 #include <sys/socket.h> /* socket specific definitions */
 #include <netinet/in.h> /* INET constants and stuff */
@@ -40,6 +42,7 @@ Maintainer: Sylvain Miermont
 #include "parson.h"
 #include "base64.h"
 #include "loragw_hal.h"
+#include "loragw_gps.h"
 #include "loragw_aux.h"
 
 #include "virtual_pkt_fwd.h"
@@ -67,6 +70,7 @@ Maintainer: Sylvain Miermont
 #define DEFAULT_STAT		30	/* default time interval for statistics */
 #define PUSH_TIMEOUT_MS		100
 #define PULL_TIMEOUT_MS		200
+#define GPS_REF_MAX_AGE		30	/* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define FETCH_SLEEP_MS		10	/* nb of ms waited when a fetch return no packets */
 
 #define	PROTOCOL_VERSION	1
@@ -84,7 +88,8 @@ Maintainer: Sylvain Miermont
 #define MIN_FSK_PREAMB	3 /* minimum FSK preamble length for this application */
 #define STD_FSK_PREAMB	4
 
-#define TX_BUFF_SIZE	((540 * NB_PKT_MAX) + 30)
+#define STATUS_SIZE		200
+#define TX_BUFF_SIZE	((540 * NB_PKT_MAX) + 30 + STATUS_SIZE)
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
@@ -123,8 +128,21 @@ static struct timeval pull_timeout = {0, (PULL_TIMEOUT_MS * 1000)}; /* non criti
 /* hardware access control and correction */
 static pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
 
-/* Reference coordinates, to send in status instead of GPS coordinates if 'fake' is enabled */
-//!static struct coord_s reference_coord;
+/* GPS configuration and synchronization */
+static char gps_tty_path[64]; /* path of the TTY port GPS is connected on */
+static int gps_tty_fd; /* file descriptor of the GPS TTY port */
+static bool gps_enabled; /* is GPS enabled on that gateway ? */
+
+/* GPS time reference */
+static pthread_mutex_t mx_timeref = PTHREAD_MUTEX_INITIALIZER; /* control access to GPS time reference */
+static bool gps_ref_valid; /* is GPS reference acceptable (ie. not too old) */
+static struct tref time_reference_gps; /* time reference used for UTC <-> timestamp conversion */
+
+/* Reference coordinates, to send in status instead of GPS coordiantes if 'fake' is enabled */
+static struct coord_s reference_coord;
+
+/* Enable faking the GPS coordinates of the gateway */
+static bool gps_fake_enable; /* enable the feature */
 
 /* measurements to establish statistics */
 static pthread_mutex_t mx_meas_up = PTHREAD_MUTEX_INITIALIZER; /* control access to the upstream measurements */
@@ -147,9 +165,25 @@ static uint32_t meas_dw_payload_byte = 0; /* sum of radio payload bytes sent for
 static uint32_t meas_nb_tx_ok = 0; /* count packets emitted successfully */
 static uint32_t meas_nb_tx_fail = 0; /* count packets were TX failed for other reasons */
 
+static pthread_mutex_t mx_meas_gps = PTHREAD_MUTEX_INITIALIZER; /* control access to the GPS statistics */
+static bool gps_coord_valid; /* could we get valid GPS coordinates ? */
+static struct coord_s meas_gps_coord; /* GPS position of the gateway */
+static struct coord_s meas_gps_err; /* GPS position of the gateway */
+
+static pthread_mutex_t mx_stat_rep = PTHREAD_MUTEX_INITIALIZER; /* control access to the status report */
+static bool report_ready = false; /* true when there is a new report to send to the server */
+static char status_report[STATUS_SIZE]; /* status report as a JSON object */
 
 /* auto-quit function */
 static uint32_t autoquit_threshold = 0; /* enable auto-quit after a number of non-acknowledged PULL_DATA (0 = disabled)*/
+
+/* Ruud: Control over the separatare subprocesses. */
+//TODO: the virtual server can only receive packets from the ghost-node, we have to integrate these functions on the real packet forwarder.
+//TODO: At the same time, the three packet forwarders have to merged into one.
+static bool upstream_enabled    = true;     /* controls the data flow from end-node to server   */
+static bool downstream_enabled  = false;    /* controls the data flow from server to end-node   */
+static bool ghoststream_enabled = true;     /* controls the data flow from ghost-node to server */
+static bool radiostream_enabled = false;    /* controls the data flow from radio-node to server */
 
 
 /* -------------------------------------------------------------------------- */
@@ -181,6 +215,8 @@ static int parse_gateway_configuration(const char * conf_file);
 /* threads */
 void thread_up(void);
 void thread_down(void);
+void thread_gps(void);
+void thread_valid(void);
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DEFINITION ----------------------------------------- */
@@ -559,8 +595,14 @@ static int parse_gateway_configuration(const char * conf_file) {
 	}
 	MSG("INFO: packets received with no CRC will%s be forwarded\n", (fwd_nocrc_pkt ? "" : " NOT"));
 
+	/* GPS module TTY path (optional) */
+	str = json_object_get_string(conf_obj, "gps_tty_path");
+	if (str != NULL) {
+		strncpy(gps_tty_path, str, sizeof gps_tty_path);
+		MSG("INFO: GPS serial port path is configured to \"%s\"\n", gps_tty_path);
+	}
+
 	/* get reference coordinates */
-	/* Disable for the moment
 	val = json_object_get_value(conf_obj, "ref_latitude");
 	if (val != NULL) {
 		reference_coord.lat = (double)json_value_get_number(val);
@@ -575,8 +617,62 @@ static int parse_gateway_configuration(const char * conf_file) {
 	if (val != NULL) {
 		reference_coord.alt = (short)json_value_get_number(val);
 		MSG("INFO: Reference altitude is configured to %i meters\n", reference_coord.alt);
-	} */
+	}
 
+	/* Gateway GPS coordinates hardcoding (aka. faking) option */
+	val = json_object_get_value(conf_obj, "fake_gps");
+	if (json_value_get_type(val) == JSONBoolean) {
+		gps_fake_enable = (bool)json_value_get_boolean(val);
+		if (gps_fake_enable == true) {
+			MSG("INFO: fake GPS is enabled\n");
+		} else {
+			MSG("INFO: fake GPS is disabled\n");
+		}
+	}
+
+	/* Read the value for upstream data */
+	val = json_object_get_value(conf_obj, "upstream");
+	if (json_value_get_type(val) == JSONBoolean) {
+		upstream_enabled = (bool)json_value_get_boolean(val);
+	}
+	if (upstream_enabled == true) {
+		MSG("INFO: Upstream data is enabled\n");
+	} else {
+		MSG("INFO: Upstream data is disabled\n");
+	}
+
+	/* Read the value for downstream_enabled data */
+	val = json_object_get_value(conf_obj, "downstream");
+	if (json_value_get_type(val) == JSONBoolean) {
+		downstream_enabled = (bool)json_value_get_boolean(val);
+	}
+	if (downstream_enabled == true) {
+		MSG("INFO: Downstream data is enabled\n");
+	} else {
+		MSG("INFO: Downstream data is disabled\n");
+	}
+
+	/* Read the value for ghoststream_enabled data */
+	val = json_object_get_value(conf_obj, "ghoststream");
+	if (json_value_get_type(val) == JSONBoolean) {
+		ghoststream_enabled = (bool)json_value_get_boolean(val);
+	}
+	if (ghoststream_enabled == true) {
+		MSG("INFO: Ghoststream data is enabled\n");
+	} else {
+		MSG("INFO: Ghoststream data is disabled\n");
+	}
+
+	/* Read the value for radiostream_enabled data */
+	val = json_object_get_value(conf_obj, "ghoststream");
+	if (json_value_get_type(val) == JSONBoolean) {
+		radiostream_enabled = (bool)json_value_get_boolean(val);
+	}
+	if (radiostream_enabled == true) {
+		MSG("INFO: Radiostream data is enabled\n");
+	} else {
+		MSG("INFO: Radiostream data is disabled\n");
+	}
 
 	/* Auto-quit threshold (optional) */
 	val = json_object_get_value(conf_obj, "autoquit_threshold");
@@ -591,7 +687,7 @@ static int parse_gateway_configuration(const char * conf_file) {
 }
 
 //Ruud: we need this outside
-double difftimespec(struct timespec end, struct timespec beginning) {
+/*static*/ double difftimespec(struct timespec end, struct timespec beginning) {
 	double x;
 
 	x = 1E-9 * (double)(end.tv_nsec - beginning.tv_nsec);
@@ -647,6 +743,8 @@ int main(void)
 	/* threads */
 	pthread_t thrid_up;
 	pthread_t thrid_down;
+	pthread_t thrid_gps;
+	pthread_t thrid_valid;
 
 	/* network socket creation */
 	struct addrinfo hints;
@@ -673,6 +771,11 @@ int main(void)
 	uint32_t cp_nb_tx_ok;
 	uint32_t cp_nb_tx_fail;
 
+	/* GPS coordinates variables */
+	bool coord_ok = false;
+	struct coord_s cp_gps_coord = {0.0, 0.0, 0};
+	//struct coord_s cp_gps_err;
+
 	/* statistics variable */
 	time_t t;
 	char stat_timestamp[24];
@@ -683,7 +786,7 @@ int main(void)
 	float dw_ack_ratio;
 
 	/* display version informations */
-	MSG("*** Basic Packet Forwarder Simulator for Lora Gateway ***\nVersion: " VERSION_STRING "\n");
+	MSG("*** GPS Packet Forwarder for Lora Gateway ***\nVersion: " VERSION_STRING "\n");
 	MSG("*** Lora concentrator HAL library version info ***\n%s\n***\n", lgw_version_info());
 
 	/* display host endianness */
@@ -719,6 +822,21 @@ int main(void)
 		MSG("ERROR: [main] failed to find any configuration file named %s, %s OR %s\n", global_cfg_path, local_cfg_path, debug_cfg_path);
 		exit(EXIT_FAILURE);
 	}
+
+	/* Start GPS a.s.a.p., to allow it to lock */
+	i = lgw_gps_enable(gps_tty_path, NULL, 0, &gps_tty_fd);
+	if (i != LGW_GPS_SUCCESS) {
+		printf("WARNING: [main] impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
+		gps_enabled = false;
+		gps_ref_valid = false;
+	} else {
+		printf("INFO: [main] TTY port %s open for GPS synchronization\n", gps_tty_path);
+		gps_enabled = true;
+		gps_ref_valid = false;
+	}
+
+	/* get timezone info */
+	tzset();
 
 	/* sanity check on configuration variables */
 	// TODO
@@ -806,17 +924,33 @@ int main(void)
 	}
 
 	/* spawn threads to manage upstream and downstream */
-	i = pthread_create( &thrid_up, NULL, (void * (*)(void *))thread_up, NULL);
-	if (i != 0) {
-		MSG("ERROR: [main] impossible to create upstream thread\n");
-		exit(EXIT_FAILURE);
+	if (upstream_enabled) {
+		i = pthread_create( &thrid_up, NULL, (void * (*)(void *))thread_up, NULL);
+		if (i != 0) {
+			MSG("ERROR: [main] impossible to create upstream thread\n");
+			exit(EXIT_FAILURE);
+		}
 	}
-// Deactiveer de down-thread voor dit moment.
-//	i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
-//	if (i != 0) {
-//		MSG("ERROR: [main] impossible to create downstream thread\n");
-//		exit(EXIT_FAILURE);
-//	}
+	i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
+	if (downstream_enabled) {
+		if (i != 0) {
+			MSG("ERROR: [main] impossible to create downstream thread\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	/* spawn thread to manage GPS */
+	if (gps_enabled == true) {
+		i = pthread_create( &thrid_gps, NULL, (void * (*)(void *))thread_gps, NULL);
+		if (i != 0) {
+			MSG("ERROR: [main] impossible to create GPS thread\n");
+			exit(EXIT_FAILURE);
+		}
+		i = pthread_create( &thrid_valid, NULL, (void * (*)(void *))thread_valid, NULL);
+		if (i != 0) {
+			MSG("ERROR: [main] impossible to create validation thread\n");
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	/* configure signal handling */
 	sigemptyset(&sigact.sa_mask);
@@ -827,7 +961,7 @@ int main(void)
 	sigaction(SIGTERM, &sigact, NULL); /* default "kill" command */
 
 	/* Start the ghost Listener */
-    ghost_start();
+    if (ghoststream_enabled && upstream_enabled) ghost_start();
 
 	/* main loop task : statistics collection */
 	while (!exit_sig && !quit_sig) {
@@ -897,6 +1031,22 @@ int main(void)
 			dw_ack_ratio = 0.0;
 		}
 
+		/* access GPS statistics, copy them */
+		if (gps_enabled == true) {
+			pthread_mutex_lock(&mx_meas_gps);
+			coord_ok = gps_coord_valid;
+			cp_gps_coord  =  meas_gps_coord;
+			//cp_gps_err    =  meas_gps_err;
+			pthread_mutex_unlock(&mx_meas_gps);
+		}
+
+		/* overwrite with reference coordinates if function is enabled */
+		if (gps_fake_enable == true) {
+			gps_enabled = true;
+			coord_ok = true;
+			cp_gps_coord = reference_coord;
+		}
+
 		/* display a report */
 		printf("\n##### %s #####\n", stat_timestamp);
 		printf("### [UPSTREAM] ###\n");
@@ -910,15 +1060,46 @@ int main(void)
 		printf("# PULL_RESP(onse) datagrams received: %u (%u bytes)\n", cp_dw_dgram_rcv, cp_dw_network_byte);
 		printf("# RF packets sent to concentrator: %u (%u bytes)\n", (cp_nb_tx_ok+cp_nb_tx_fail), cp_dw_payload_byte);
 		printf("# TX errors: %u\n", cp_nb_tx_fail);
-    	//!printf("# Manual GPS coordinates: latitude %.5f, longitude %.5f, altitude %i m\n", cp_gps_coord.lat, cp_gps_coord.lon, cp_gps_coord.alt);
+		printf("### [GPS] ###\n");
+		if (gps_enabled == true) {
+			/* no need for mutex, display is not critical */
+			if (gps_ref_valid == true) {
+				printf("# Valid time reference (age: %li sec)\n", (long)difftime(time(NULL), time_reference_gps.systime));
+			} else {
+				printf("# Invalid time reference (age: %li sec)\n", (long)difftime(time(NULL), time_reference_gps.systime));
+			}
+			if (gps_fake_enable == true) {
+				printf("# GPS *FAKE* coordinates: latitude %.5f, longitude %.5f, altitude %i m\n", cp_gps_coord.lat, cp_gps_coord.lon, cp_gps_coord.alt);
+			} else if (coord_ok == true) {
+				printf("# GPS coordinates: latitude %.5f, longitude %.5f, altitude %i m\n", cp_gps_coord.lat, cp_gps_coord.lon, cp_gps_coord.alt);
+			} else {
+				printf("# no valid GPS coordinates available yet\n");
+			}
+		} else {
+			printf("# GPS sync is disabled\n");
+		}
 		printf("##### END #####\n");
+
+		/* generate a JSON report (will be sent to server by upstream thread) */
+		pthread_mutex_lock(&mx_stat_rep);
+		if ((gps_enabled == true) && (coord_ok == true)) {
+			//printf("# DEBUG: STATUS WITH GPS\n");
+			snprintf(status_report, STATUS_SIZE, "\"stat\":{\"time\":\"%s\",\"lati\":%.5f,\"long\":%.5f,\"alti\":%i,\"rxnb\":%u,\"rxok\":%u,\"rxfw\":%u,\"ackr\":%.1f,\"dwnb\":%u,\"txnb\":%u}", stat_timestamp, cp_gps_coord.lat, cp_gps_coord.lon, cp_gps_coord.alt, cp_nb_rx_rcv, cp_nb_rx_ok, cp_up_pkt_fwd, 100.0 * up_ack_ratio, cp_dw_dgram_rcv, cp_nb_tx_ok);
+		} else {
+			//printf("# DEBUG: BARE STATUS\n");
+			snprintf(status_report, STATUS_SIZE, "\"stat\":{\"time\":\"%s\",\"rxnb\":%u,\"rxok\":%u,\"rxfw\":%u,\"ackr\":%.1f,\"dwnb\":%u,\"txnb\":%u}", stat_timestamp, cp_nb_rx_rcv, cp_nb_rx_ok, cp_up_pkt_fwd, 100.0 * up_ack_ratio, cp_dw_dgram_rcv, cp_nb_tx_ok);
+		}
+		report_ready = true;
+		pthread_mutex_unlock(&mx_stat_rep);
 	}
 
 	/* wait for upstream thread to finish (1 fetch cycle max) */
-	pthread_join(thrid_up, NULL);
-//	pthread_cancel(thrid_down); /* don't wait for downstream thread */
+	if (upstream_enabled) pthread_join(thrid_up, NULL);
+	if (downstream_enabled) pthread_cancel(thrid_down); /* don't wait for downstream thread */
 	/* stop ghost listener*/
-	ghost_stop();
+	if (ghoststream_enabled) ghost_stop();
+	pthread_cancel(thrid_gps); /* don't wait for GPS thread */
+	pthread_cancel(thrid_valid); /* don't wait for validation thread */
 
 	/* if an exit signal was received, try to quit properly */
 	if (exit_sig) {
@@ -952,8 +1133,12 @@ void thread_up(void) {
 
 	/* local timestamp variables until we get accurate GPS time */
 	struct timespec fetch_time;
-	struct tm * x;
+	struct tm * x1;
 	char fetch_timestamp[28]; /* timestamp as a text string */
+
+	/* local copy of GPS time reference */
+	bool ref_ok = false; /* determine if GPS time reference must be used or not */
+	struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
 
 	/* data buffers */
 	uint8_t buff_up[TX_BUFF_SIZE]; /* buffer to compose the upstream packet */
@@ -967,6 +1152,13 @@ void thread_up(void) {
 	/* ping measurement variables */
 	struct timespec send_time;
 	struct timespec recv_time;
+
+	/* GPS synchronization variables */
+	struct timespec pkt_utc_time;
+	struct tm * x2; /* broken-up UTC time */
+
+	/* report management variable */
+	bool send_report = false;
 
 	/* set upstream socket RX timeout */
 	i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
@@ -985,23 +1177,39 @@ void thread_up(void) {
 
 		/* fetch packets */
 		pthread_mutex_lock(&mx_concent);
-		// Ruud: tijdelijk de spi uitschakelen
-		//nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
-		nb_pkt = ghost_get(NB_PKT_MAX, rxpkt);
-
+		// Ruud: tijdelijk de spi uitschakelen, hier moet een test voor de radio stream komen, maar dat heeft in de virtuele packet forwarder geen zin.
+		// nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
+		if (ghoststream_enabled) nb_pkt = ghost_get(NB_PKT_MAX, rxpkt); else nb_pkt = 0;
 		pthread_mutex_unlock(&mx_concent);
 		if (nb_pkt == LGW_HAL_ERROR) {
 			MSG("ERROR: [up] failed packet fetch, exiting\n");
 			exit(EXIT_FAILURE);
-		} else if (nb_pkt == 0) {
-			wait_ms(FETCH_SLEEP_MS); /* wait a short time if no packets */
+		}
+
+		/* check if there are status report to send */
+		send_report = report_ready; /* copy the variable so it doesn't change mid-function */
+		/* no mutex, we're only reading */
+
+		/* wait a short time if no packets, nor status report */
+		if ((nb_pkt == 0) && (send_report == false)) {
+			wait_ms(FETCH_SLEEP_MS);
 			continue;
+		}
+
+		/* get a copy of GPS time reference (avoid 1 mutex per packet) */
+		if ((nb_pkt > 0) && (gps_enabled == true)) {
+			pthread_mutex_lock(&mx_timeref);
+			ref_ok = gps_ref_valid;
+			local_ref = time_reference_gps;
+			pthread_mutex_unlock(&mx_timeref);
+		} else {
+			ref_ok = false;
 		}
 
 		/* local timestamp generation until we get accurate GPS time */
 		clock_gettime(CLOCK_REALTIME, &fetch_time);
-		x = gmtime(&(fetch_time.tv_sec)); /* split the UNIX timestamp to its calendar components */
-		snprintf(fetch_timestamp, sizeof fetch_timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%06liZ", (x->tm_year)+1900, (x->tm_mon)+1, x->tm_mday, x->tm_hour, x->tm_min, x->tm_sec, (fetch_time.tv_nsec)/1000); /* ISO 8601 format */
+		x1 = gmtime(&(fetch_time.tv_sec)); /* split the UNIX timestamp to its calendar components */
+		snprintf(fetch_timestamp, sizeof fetch_timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%06liZ", (x1->tm_year)+1900, (x1->tm_mon)+1, x1->tm_mday, x1->tm_hour, x1->tm_min, x1->tm_sec, (fetch_time.tv_nsec)/1000); /* ISO 8601 format */
 
 		/* start composing datagram with the header */
 		token_h = (uint8_t)rand(); /* random token */
@@ -1077,6 +1285,23 @@ void thread_up(void) {
 			memcpy((void *)(buff_up + buff_index), (void *)",\"time\":\"???????????????????????????\"", 37);
 			memcpy((void *)(buff_up + buff_index + 9), (void *)fetch_timestamp, 27);
 			buff_index += 37;
+
+//			/* Packet RX time (GPS based), 37 useful chars */
+//			if (ref_ok == true) {
+//				/* convert packet timestamp to UTC absolute time */
+//				j = lgw_cnt2utc(local_ref, p->count_us, &pkt_utc_time);
+//				if (j == LGW_GPS_SUCCESS) {
+//					/* split the UNIX timestamp to its calendar components */
+//					x = gmtime(&(pkt_utc_time.tv_sec));
+//					j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"time\":\"%04i-%02i-%02iT%02i:%02i:%02i.%06liZ\"", (x->tm_year)+1900, (x->tm_mon)+1, x->tm_mday, x->tm_hour, x->tm_min, x->tm_sec, (pkt_utc_time.tv_nsec)/1000); /* ISO 8601 format */
+//					if (j > 0) {
+//						buff_index += j;
+//					} else {
+//						MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+//						exit(EXIT_FAILURE);
+//					}
+//				}
+//			}
 
 			/* Packet concentrator channel, RF chain & RX frequency, 34-36 useful chars */
 			j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"chan\":%1u,\"rfch\":%1u,\"freq\":%.6lf", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6));
@@ -1253,12 +1478,38 @@ void thread_up(void) {
 
 		/* restart fetch sequence without sending empty JSON if all packets have been filtered out */
 		if (pkt_in_dgram == 0) {
-			continue;
+			if (send_report == true) {
+				/* need to clean up the beginning of the payload */
+				buff_index -= 8; /* removes "rxpk":[ */
+			} else {
+				/* all packet have been filtered out and no report, restart loop */
+				continue;
+			}
+		} else {
+			/* end of packet array */
+			buff_up[buff_index] = ']';
+			++buff_index;
+			/* add separator if needed */
+			if (send_report == true) {
+				buff_up[buff_index] = ',';
+				++buff_index;
+			}
 		}
 
-		/* end of packet array */
-		buff_up[buff_index] = ']';
-		++buff_index;
+		/* add status report if a new one is available */
+		if (send_report == true) {
+			//printf("# DEBUG: send_report = true \n");
+			pthread_mutex_lock(&mx_stat_rep);
+			report_ready = false;
+			j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, "%s", status_report);
+			pthread_mutex_unlock(&mx_stat_rep);
+			if (j > 0) {
+				buff_index += j;
+			} else {
+				MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 5));
+				exit(EXIT_FAILURE);
+			}
+		}
 
 		/* end of JSON datagram payload */
 		buff_up[buff_index] = '}';
@@ -1331,6 +1582,13 @@ void thread_down(void) {
 	JSON_Value *val = NULL; /* needed to detect the absence of some fields */
 	const char *str; /* pointer to sub-strings in the JSON data */
 	short x0, x1;
+	short x2, x3, x4;
+	double x5, x6;
+
+	/* variables to send on UTC timestamp */
+	struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
+	struct tm utc_vector; /* for collecting the elements of the UTC time */
+	struct timespec utc_tx; /* UTC time that needs to be converted to timestamp */
 
 	/* auto-quit variable */
 	uint32_t autoquit_cnt = 0; /* count the number of PULL_DATA sent since the latest PULL_ACK */
@@ -1446,9 +1704,58 @@ void thread_down(void) {
 					txpkt.count_us = (uint32_t)json_value_get_number(val);
 					MSG("INFO: [down] a packet will be sent on timestamp value %u\n", txpkt.count_us);
 				} else {
-					MSG("WARNING: [down] only \"immediate\" and \"timestamp\" modes supported, TX aborted\n");
-					json_value_free(root_val);
-					continue;
+					//!MSG("WARNING: [down] only \"immediate\" and \"timestamp\" modes supported, TX aborted\n");
+					//!json_value_free(root_val);
+					//!continue;
+					/* TX procedure: send on UTC time (converted to timestamp value) */
+					str = json_object_get_string(txpk_obj, "time");
+					if (str == NULL) {
+						MSG("WARNING: [down] no mandatory \"txpk.tmst\" or \"txpk.time\" objects in JSON, TX aborted\n");
+						json_value_free(root_val);
+						continue;
+					}
+					if (gps_enabled == true) {
+						pthread_mutex_lock(&mx_timeref);
+						if (gps_ref_valid == true) {
+							local_ref = time_reference_gps;
+							pthread_mutex_unlock(&mx_timeref);
+						} else {
+							pthread_mutex_unlock(&mx_timeref);
+							MSG("WARNING: [down] no valid GPS time reference yet, impossible to send packet on specific UTC time, TX aborted\n");
+							json_value_free(root_val);
+							continue;
+						}
+					} else {
+						MSG("WARNING: [down] GPS disabled, impossible to send packet on specific UTC time, TX aborted\n");
+						json_value_free(root_val);
+						continue;
+					}
+
+					i = sscanf (str, "%4hd-%2hd-%2hdT%2hd:%2hd:%9lf", &x0, &x1, &x2, &x3, &x4, &x5);
+					if (i != 6 ) {
+						MSG("WARNING: [down] \"txpk.time\" must follow ISO 8601 format, TX aborted\n");
+						json_value_free(root_val);
+						continue;
+					}
+					x5 = modf(x5, &x6); /* x6 get the integer part of x5, x5 the fractional part */
+					utc_vector.tm_year = x0 - 1900; /* years since 1900 */
+					utc_vector.tm_mon = x1 - 1; /* months since January */
+					utc_vector.tm_mday = x2; /* day of the month 1-31 */
+					utc_vector.tm_hour = x3; /* hours since midnight */
+					utc_vector.tm_min = x4; /* minutes after the hour */
+					utc_vector.tm_sec = (int)x6;
+					utc_tx.tv_sec = mktime(&utc_vector) - timezone;
+					utc_tx.tv_nsec = (long)(1e9 * x5);
+
+					/* transform UTC time to timestamp */
+					i = lgw_utc2cnt(local_ref, utc_tx, &(txpkt.count_us));
+					if (i != LGW_GPS_SUCCESS) {
+						MSG("WARNING: [down] could not convert UTC time to timestamp, TX aborted\n");
+						json_value_free(root_val);
+						continue;
+					} else {
+						MSG("INFO: [down] a packet will be sent on timestamp value %u (calculated from UTC time)\n", txpkt.count_us);
+					}
 				}
 			}
 
@@ -1660,6 +1967,113 @@ void thread_down(void) {
 		}
 	}
 	MSG("\nINFO: End of downstream thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 3: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
+
+void thread_gps(void) {
+	int i;
+
+	/* serial variables */
+	char serial_buff[128]; /* buffer to receive GPS data */
+	ssize_t nb_char;
+
+	/* variables for PPM pulse GPS synchronization */
+	enum gps_msg latest_msg; /* keep track of latest NMEA message parsed */
+	struct timespec utc_time; /* UTC time associated with PPS pulse */
+	uint32_t trig_tstamp; /* concentrator timestamp associated with PPM pulse */
+
+	/* position variable */
+	struct coord_s coord;
+	struct coord_s gpserr;
+
+	/* initialize some variables before loop */
+	memset(serial_buff, 0, sizeof serial_buff);
+
+	while (!exit_sig && !quit_sig) {
+		/* blocking canonical read on serial port */
+		nb_char = read(gps_tty_fd, serial_buff, sizeof(serial_buff)-1);
+		if (nb_char <= 0) {
+			MSG("WARNING: [gps] read() returned value <= 0\n");
+			continue;
+		} else {
+			serial_buff[nb_char] = 0; /* add null terminator, just to be sure */
+		}
+
+		/* parse the received NMEA */
+		latest_msg = lgw_parse_nmea(serial_buff, sizeof(serial_buff));
+
+		if (latest_msg == NMEA_RMC) { /* trigger sync only on RMC frames */
+
+			/* get UTC time for synchronization */
+			i = lgw_gps_get(&utc_time, NULL, NULL);
+			if (i != LGW_GPS_SUCCESS) {
+				MSG("WARNING: [gps] could not get UTC time from GPS\n");
+				continue;
+			}
+
+			/* get timestamp captured on PPM pulse  */
+			pthread_mutex_lock(&mx_concent);
+			i = lgw_get_trigcnt(&trig_tstamp);
+			pthread_mutex_unlock(&mx_concent);
+			if (i != LGW_HAL_SUCCESS) {
+				MSG("WARNING: [gps] failed to read concentrator timestamp\n");
+				continue;
+			}
+
+			/* try to update time reference with the new UTC & timestamp */
+			pthread_mutex_lock(&mx_timeref);
+			i = lgw_gps_sync(&time_reference_gps, trig_tstamp, utc_time);
+			pthread_mutex_unlock(&mx_timeref);
+			if (i != LGW_GPS_SUCCESS) {
+				MSG("WARNING: [gps] GPS out of sync, keeping previous time reference\n");
+				continue;
+			}
+
+			/* update gateway coordinates */
+			i = lgw_gps_get(NULL, &coord, &gpserr);
+			pthread_mutex_lock(&mx_meas_gps);
+			if (i == LGW_GPS_SUCCESS) {
+				gps_coord_valid = true;
+				meas_gps_coord = coord;
+				meas_gps_err = gpserr;
+				// TODO: report other GPS statistics (typ. signal quality & integrity)
+			} else {
+				gps_coord_valid = false;
+			}
+			pthread_mutex_unlock(&mx_meas_gps);
+		}
+	}
+	MSG("\nINFO: End of GPS thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 4: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
+
+void thread_valid(void) {
+
+	/* GPS reference validation variables */
+	long gps_ref_age = 0;
+
+	/* main loop task */
+	while (!exit_sig && !quit_sig) {
+		wait_ms(1000);
+
+		/* calculate when the time reference was last updated */
+		pthread_mutex_lock(&mx_timeref);
+		gps_ref_age = (long)difftime(time(NULL), time_reference_gps.systime);
+		if ((gps_ref_age >= 0) && (gps_ref_age <= GPS_REF_MAX_AGE)) {
+			/* time ref is ok, validate and  */
+			gps_ref_valid = true;
+		} else {
+			/* time ref is too old, invalidate */
+			gps_ref_valid = false;
+		}
+		pthread_mutex_unlock(&mx_timeref);
+
+	}
+	MSG("\nINFO: End of validation thread\n");
 }
 
 /* --- EOF ------------------------------------------------------------------ */

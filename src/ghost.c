@@ -96,7 +96,7 @@ typedef union
 { uint32_t u;
   float f; } mix;
 
-/* Helper functions for architecture independent conversion of data packet to structure lgw_pkt_rx_s */
+/* Helper functions for architecture independent conversion (BE!) of data packet to structure lgw_pkt_rx_s */
 static uint32_t u32(uint8_t *p, uint8_t i) { return (uint32_t)(p[i+3]) + ((uint32_t)(p[i+2])<<8) + ((uint32_t)(p[i+1])<<16) + ((uint32_t)(p[i])<<24);  }
 static uint16_t u16(uint8_t *p, uint8_t i) { return (uint16_t)p[i+1] + ((uint16_t)p[i]<<8);  }
 static uint8_t u8(uint8_t *p, uint8_t i)   { return p[i]; }
