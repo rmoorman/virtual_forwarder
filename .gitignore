@@ -30,3 +30,15 @@
 
 # Debug files
 *.dSYM/
+
+#eclipse specific
+.classpath
+.project
+.cproject
+.settings/
+
+#project specific
+gps
+bare
+local_conf_*
+
