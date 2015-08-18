@@ -63,6 +63,9 @@ Maintainer: Sylvain Miermont
   #define VERSION_STRING "undefined"
 #endif
 
+//Ruud: Lets support up to 4 servers, more does not seem realistic
+#define MAX_SERVERS		    4 /* Number of servers data is send to (or obtained from) */
+
 #define DEFAULT_SERVER		127.0.0.1 /* hostname also supported */
 #define DEFAULT_PORT_UP		1780
 #define DEFAULT_PORT_DW		1782
@@ -105,9 +108,14 @@ static bool fwd_nocrc_pkt = false; /* packets with NO PAYLOAD CRC are NOT forwar
 
 /* network configuration variables */
 static uint64_t lgwm = 0; /* Lora gateway MAC address */
-static char serv_addr[64] = STR(DEFAULT_SERVER); /* address of the server (host name or IPv4/IPv6) */
-static char serv_port_up[8] = STR(DEFAULT_PORT_UP); /* server port for upstream traffic */
-static char serv_port_down[8] = STR(DEFAULT_PORT_DW); /* server port for downstream traffic */
+//Ruud, counter for more servers
+static uint8_t serv_count = 0;
+//static char serv_addr[64] = STR(DEFAULT_SERVER); /* address of the server (host name or IPv4/IPv6) */
+//static char serv_port_up[8] = STR(DEFAULT_PORT_UP); /* server port for upstream traffic */
+//static char serv_port_down[8] = STR(DEFAULT_PORT_DW); /* server port for downstream traffic */
+static char serv_addr[MAX_SERVERS][64]; /* address of the server (host name or IPv4/IPv6) */
+static char serv_port_up[MAX_SERVERS][8]; /* server port for upstream traffic */
+static char serv_port_down[MAX_SERVERS][8]; /* server port for downstream traffic */
 static int keepalive_time = DEFAULT_KEEPALIVE; /* send a PULL_DATA request every X seconds, negative = disabled */
 
 /* statistics collection configuration variables */
@@ -118,8 +126,8 @@ static uint32_t net_mac_h; /* Most Significant Nibble, network order */
 static uint32_t net_mac_l; /* Least Significant Nibble, network order */
 
 /* network sockets */
-static int sock_up; /* socket for upstream traffic */
-static int sock_down; /* socket for downstream traffic */
+static int sock_up[MAX_SERVERS]; /* socket for upstream traffic */
+static int sock_down[MAX_SERVERS]; /* socket for downstream traffic */
 
 /* network protocol variables */
 static struct timeval push_timeout_half = {0, (PUSH_TIMEOUT_MS * 500)}; /* cut in half, critical for throughput */
@@ -214,7 +222,7 @@ static int parse_gateway_configuration(const char * conf_file);
 
 /* threads */
 void thread_up(void);
-void thread_down(void);
+void thread_down(void* pic);
 void thread_gps(void);
 void thread_valid(void);
 
@@ -511,8 +519,10 @@ static int parse_gateway_configuration(const char * conf_file) {
 	JSON_Value *root_val;
 	JSON_Object *conf_obj = NULL;
 	JSON_Value *val = NULL; /* needed to detect the absence of some fields */
+	JSON_Array *servers = NULL;
 	const char *str; /* pointer to sub-strings in the JSON data */
 	unsigned long long ull = 0;
+	int ic; /* Server counter*/
 
 	/* try to parse JSON */
 	root_val = json_parse_file_with_comments(conf_file);
@@ -538,23 +548,64 @@ static int parse_gateway_configuration(const char * conf_file) {
 		MSG("INFO: gateway MAC address is configured to %016llX\n", ull);
 	}
 
+	// Hier begint de oude server read
 	/* server hostname or IP address (optional) */
 	str = json_object_get_string(conf_obj, "server_address");
 	if (str != NULL) {
-		strncpy(serv_addr, str, sizeof serv_addr);
-		MSG("INFO: server hostname or IP address is configured to \"%s\"\n", serv_addr);
+		serv_count = 1;
+		strncpy(serv_addr[0], str, sizeof serv_addr[0]);
+		MSG("INFO: server hostname or IP address is configured to \"%s\"\n", serv_addr[0]);
 	}
 
 	/* get up and down ports (optional) */
 	val = json_object_get_value(conf_obj, "serv_port_up");
 	if (val != NULL) {
-		snprintf(serv_port_up, sizeof serv_port_up, "%u", (uint16_t)json_value_get_number(val));
-		MSG("INFO: upstream port is configured to \"%s\"\n", serv_port_up);
+		snprintf(serv_port_up[0], sizeof serv_port_up[0], "%u", (uint16_t)json_value_get_number(val));
+		MSG("INFO: upstream port is configured to \"%s\"\n", serv_port_up[0]);
 	}
 	val = json_object_get_value(conf_obj, "serv_port_down");
 	if (val != NULL) {
-		snprintf(serv_port_down, sizeof serv_port_down, "%u", (uint16_t)json_value_get_number(val));
-		MSG("INFO: downstream port is configured to \"%s\"\n", serv_port_down);
+		snprintf(serv_port_down[0], sizeof serv_port_down[0], "%u", (uint16_t)json_value_get_number(val));
+		MSG("INFO: downstream port is configured to \"%s\"\n", serv_port_down[0]);
+	}
+
+	// Hier begint de nieuwe server array read
+	JSON_Object *nw_server = NULL;
+	servers = json_object_get_array(conf_obj, "servers");
+	if (servers != NULL && serv_count > 0)  MSG("INFO: Array of servers may overwrite specific server.\n");
+	if (servers != NULL) {
+		serv_count = json_array_get_count(servers);
+		MSG("INFO: Found %i servers in array.\n", serv_count);
+		if (serv_count > MAX_SERVERS) MSG("WARN: Only %i servers allowed, ignoring rest.", MAX_SERVERS);
+		for (ic = 0; ic < serv_count  && ic < MAX_SERVERS; ic++) {
+			nw_server = json_array_get_object(servers,ic);
+			str = json_object_get_string(nw_server, "server_address");
+			/* server hostname or IP address (optional) */
+			if (str != NULL) {
+				strncpy(serv_addr[ic], str, sizeof serv_addr[ic]);
+				MSG("INFO: server %i hostname or IP address is configured to \"%s\"\n", ic, serv_addr[ic]);
+			}
+			/* get up and down ports (optional) */
+			val = json_object_get_value(nw_server, "serv_port_up");
+			if (val != NULL) {
+				snprintf(serv_port_up[ic], sizeof serv_port_up[ic], "%u", (uint16_t)json_value_get_number(val));
+				MSG("INFO: upstream port on server %i is configured to \"%s\"\n", ic, serv_port_up[ic]);
+			}
+			val = json_object_get_value(nw_server, "serv_port_down");
+			if (val != NULL) {
+				snprintf(serv_port_down[ic], sizeof serv_port_down[ic], "%u", (uint16_t)json_value_get_number(val));
+				MSG("INFO: downstream port on server %i is configured to \"%s\"\n", ic, serv_port_down[ic]);
+			}
+		}
+	}
+
+	// Hier begint het invullen van de default waarden.
+	if (serv_count == 0) {
+		MSG("INFO: Using defaults for server and ports (specific ports are ignored if no server is defined)", serv_addr[0]);
+		strncpy(serv_addr[0],STR(DEFAULT_SERVER),sizeof(STR(DEFAULT_SERVER)));
+		strncpy(serv_port_up[0],STR(DEFAULT_PORT_UP),sizeof(STR(DEFAULT_PORT_UP)));
+		strncpy(serv_port_down[0],STR(DEFAULT_PORT_DW),sizeof(STR(DEFAULT_PORT_DW)));
+		serv_count = 1;
 	}
 
 	/* get keep-alive interval (in seconds) for downstream (optional) */
@@ -734,6 +785,7 @@ int main(void)
 {
 	struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
 	int i; /* loop variable and temporary variable for return value */
+	int ic; /* Server loop variable */
 
 	/* configuration file related */
 	char *global_cfg_path= "global_conf.json"; /* contain global (typ. network-wide) configuration */
@@ -850,69 +902,74 @@ int main(void)
 	hints.ai_family = AF_UNSPEC; /* should handle IP v4 or v6 automatically */
 	hints.ai_socktype = SOCK_DGRAM;
 
-	/* look for server address w/ upstream port */
-	i = getaddrinfo(serv_addr, serv_port_up, &hints, &result);
-	if (i != 0) {
-		MSG("ERROR: [up] getaddrinfo on address %s (PORT %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
-		exit(EXIT_FAILURE);
-	}
 
-	/* try to open socket for upstream traffic */
-	for (q=result; q!=NULL; q=q->ai_next) {
-		sock_up = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
-		if (sock_up == -1) continue; /* try next field */
-		else break; /* success, get out of loop */
-	}
-	if (q == NULL) {
-		MSG("ERROR: [up] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
-		i = 1;
-		for (q=result; q!=NULL; q=q->ai_next) {
-			getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
-			MSG("INFO: [up] result %i host:%s service:%s\n", i, host_name, port_name);
-			++i;
+	/* Loop through all servers */
+	for (ic = 0; ic < serv_count; ic++) {
+
+		/* look for server address w/ upstream port */
+		i = getaddrinfo(serv_addr[ic], serv_port_up[ic], &hints, &result);
+		if (i != 0) {
+			MSG("ERROR: [up] getaddrinfo on address %s (PORT %s) returned %s\n", serv_addr[ic], serv_port_up[ic], gai_strerror(i));
+			exit(EXIT_FAILURE);
 		}
-		exit(EXIT_FAILURE);
-	}
 
-	/* connect so we can send/receive packet with the server only */
-	i = connect(sock_up, q->ai_addr, q->ai_addrlen);
-	if (i != 0) {
-		MSG("ERROR: [up] connect returned %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-	freeaddrinfo(result);
-
-	/* look for server address w/ downstream port */
-	i = getaddrinfo(serv_addr, serv_port_down, &hints, &result);
-	if (i != 0) {
-		MSG("ERROR: [down] getaddrinfo on address %s (port %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
-		exit(EXIT_FAILURE);
-	}
-
-	/* try to open socket for downstream traffic */
-	for (q=result; q!=NULL; q=q->ai_next) {
-		sock_down = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
-		if (sock_down == -1) continue; /* try next field */
-		else break; /* success, get out of loop */
-	}
-	if (q == NULL) {
-		MSG("ERROR: [down] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
-		i = 1;
+		/* try to open socket for upstream traffic */
 		for (q=result; q!=NULL; q=q->ai_next) {
-			getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
-			MSG("INFO: [down] result %i host:%s service:%s\n", i, host_name, port_name);
-			++i;
+			sock_up[ic] = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+			if (sock_up[ic] == -1) continue; /* try next field */
+			else break; /* success, get out of loop */
 		}
-		exit(EXIT_FAILURE);
-	}
+		if (q == NULL) {
+			MSG("ERROR: [up] failed to open socket to any of server %s addresses (port %s)\n", serv_addr[ic], serv_port_up[ic]);
+			i = 1;
+			for (q=result; q!=NULL; q=q->ai_next) {
+				getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
+				MSG("INFO: [up] result %i host:%s service:%s\n", i, host_name, port_name);
+				++i;
+			}
+			exit(EXIT_FAILURE);
+		}
 
-	/* connect so we can send/receive packet with the server only */
-	i = connect(sock_down, q->ai_addr, q->ai_addrlen);
-	if (i != 0) {
-		MSG("ERROR: [down] connect returned %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
+		/* connect so we can send/receive packet with the server only */
+		i = connect(sock_up[ic], q->ai_addr, q->ai_addrlen);
+		if (i != 0) {
+			MSG("ERROR: [up] connect returned %s\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		freeaddrinfo(result);
+
+		/* look for server address w/ downstream port */
+		i = getaddrinfo(serv_addr[ic], serv_port_down[ic], &hints, &result);
+		if (i != 0) {
+			MSG("ERROR: [down] getaddrinfo on address %s (port %s) returned %s\n", serv_addr[ic], serv_port_up[ic], gai_strerror(i));
+			exit(EXIT_FAILURE);
+		}
+
+		/* try to open socket for downstream traffic */
+		for (q=result; q!=NULL; q=q->ai_next) {
+			sock_down[ic] = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+			if (sock_down[ic] == -1) continue; /* try next field */
+			else break; /* success, get out of loop */
+		}
+		if (q == NULL) {
+			MSG("ERROR: [down] failed to open socket to any of server %s addresses (port %s)\n", serv_addr[ic], serv_port_up[ic]);
+			i = 1;
+			for (q=result; q!=NULL; q=q->ai_next) {
+				getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
+				MSG("INFO: [down] result %i host:%s service:%s\n", i, host_name, port_name);
+				++i;
+			}
+			exit(EXIT_FAILURE);
+		}
+
+		/* connect so we can send/receive packet with the server only */
+		i = connect(sock_down[ic], q->ai_addr, q->ai_addrlen);
+		if (i != 0) {
+			MSG("ERROR: [down] connect returned %s\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		freeaddrinfo(result);
 	}
-	freeaddrinfo(result);
 
 	/* starting the concentrator */
 	i = lgw_start();
@@ -931,11 +988,13 @@ int main(void)
 			exit(EXIT_FAILURE);
 		}
 	}
-	i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
 	if (downstream_enabled) {
-		if (i != 0) {
-			MSG("ERROR: [main] impossible to create downstream thread\n");
-			exit(EXIT_FAILURE);
+		for (ic = 0; ic < serv_count; ic++) {
+			i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, (void *) (long) ic);
+			if (i != 0) {
+				MSG("ERROR: [main] impossible to create downstream thread\n");
+				exit(EXIT_FAILURE);
+			}
 		}
 	}
 	/* spawn thread to manage GPS */
@@ -1104,8 +1163,9 @@ int main(void)
 	/* if an exit signal was received, try to quit properly */
 	if (exit_sig) {
 		/* shut down network sockets */
-		shutdown(sock_up, SHUT_RDWR);
-		shutdown(sock_down, SHUT_RDWR);
+		for (ic = 0; ic < serv_count; ic++)
+		{ shutdown(sock_up[ic], SHUT_RDWR);
+		  shutdown(sock_down[ic], SHUT_RDWR); }
 		/* stop the hardware */
 		i = lgw_stop();
 		if (i == LGW_HAL_SUCCESS) {
@@ -1124,6 +1184,7 @@ int main(void)
 
 void thread_up(void) {
 	int i, j; /* loop variables */
+	int ic; /* Server Loop Variable */
 	unsigned pkt_in_dgram; /* nb on Lora packet in the current datagram */
 
 	/* allocate memory for packet fetching and processing */
@@ -1161,10 +1222,12 @@ void thread_up(void) {
 	bool send_report = false;
 
 	/* set upstream socket RX timeout */
-	i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
-	if (i != 0) {
-		MSG("ERROR: [up] setsockopt returned %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
+	for (ic = 0; ic < serv_count; ic++) {
+		i = setsockopt(sock_up[ic], SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
+		if (i != 0) {
+			MSG("ERROR: [up] setsockopt for server %i returned %s\n", ic, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
 	}
 
 	/* pre-fill the data buffer with fixed fields */
@@ -1518,36 +1581,39 @@ void thread_up(void) {
 
 		// printf("\nJSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
 
-		/* send datagram to server */
-		send(sock_up, (void *)buff_up, buff_index, 0);
-		clock_gettime(CLOCK_MONOTONIC, &send_time);
-		pthread_mutex_lock(&mx_meas_up);
-		meas_up_dgram_sent += 1;
-		meas_up_network_byte += buff_index;
+		/* send datagram to servers sequentially */
+		// TODO make this parallel.
+		for (ic = 0; ic < serv_count; ic++) {
+			send(sock_up[ic], (void *)buff_up, buff_index, 0);
+			clock_gettime(CLOCK_MONOTONIC, &send_time);
+			pthread_mutex_lock(&mx_meas_up);
+			meas_up_dgram_sent += 1;
+			meas_up_network_byte += buff_index;
 
-		/* wait for acknowledge (in 2 times, to catch extra packets) */
-		for (i=0; i<2; ++i) {
-			j = recv(sock_up, (void *)buff_ack, sizeof buff_ack, 0);
-			clock_gettime(CLOCK_MONOTONIC, &recv_time);
-			if (j == -1) {
-				if (errno == EAGAIN) { /* timeout */
+			/* wait for acknowledge (in 2 times, to catch extra packets) */
+			for (i=0; i<2; ++i) {
+				j = recv(sock_up[ic], (void *)buff_ack, sizeof buff_ack, 0);
+				clock_gettime(CLOCK_MONOTONIC, &recv_time);
+				if (j == -1) {
+					if (errno == EAGAIN) { /* timeout */
+						continue;
+					} else { /* server connection error */
+						break;
+					}
+				} else if ((j < 4) || (buff_ack[0] != PROTOCOL_VERSION) || (buff_ack[3] != PKT_PUSH_ACK)) {
+					//MSG("WARNING: [up] ignored invalid non-ACL packet\n");
 					continue;
-				} else { /* server connection error */
+				} else if ((buff_ack[1] != token_h) || (buff_ack[2] != token_l)) {
+					//MSG("WARNING: [up] ignored out-of sync ACK packet\n");
+					continue;
+				} else {
+					MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
+					meas_up_ack_rcv += 1;
 					break;
 				}
-			} else if ((j < 4) || (buff_ack[0] != PROTOCOL_VERSION) || (buff_ack[3] != PKT_PUSH_ACK)) {
-				//MSG("WARNING: [up] ignored invalid non-ACL packet\n");
-				continue;
-			} else if ((buff_ack[1] != token_h) || (buff_ack[2] != token_l)) {
-				//MSG("WARNING: [up] ignored out-of sync ACK packet\n");
-				continue;
-			} else {
-				MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
-				meas_up_ack_rcv += 1;
-				break;
 			}
+			pthread_mutex_unlock(&mx_meas_up);
 		}
-		pthread_mutex_unlock(&mx_meas_up);
 	}
 	MSG("\nINFO: End of upstream thread\n");
 }
@@ -1555,8 +1621,12 @@ void thread_up(void) {
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 2: POLLING SERVER AND EMITTING PACKETS ------------------------ */
 
-void thread_down(void) {
+//Ruud: each server needs a seperate polling thread.
+// TODO: factor this out and inspect the use of global variables.
+
+void thread_down(void* pic) {
 	int i; /* loop variables */
+    int ic = (int) (long) pic;
 
 	/* configuration and metadata for an outbound packet */
 	struct lgw_pkt_tx_s txpkt;
@@ -1594,9 +1664,9 @@ void thread_down(void) {
 	uint32_t autoquit_cnt = 0; /* count the number of PULL_DATA sent since the latest PULL_ACK */
 
 	/* set downstream socket RX timeout */
-	i = setsockopt(sock_down, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
+	i = setsockopt(sock_down[ic], SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
 	if (i != 0) {
-		MSG("ERROR: [down] setsockopt returned %s\n", strerror(errno));
+		MSG("ERROR: [down] setsockopt for server %i returned %s\n", ic, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
@@ -1622,7 +1692,7 @@ void thread_down(void) {
 		buff_req[2] = token_l;
 
 		/* send PULL request and record time */
-		send(sock_down, (void *)buff_req, sizeof buff_req, 0);
+		send(sock_down[ic], (void *)buff_req, sizeof buff_req, 0);
 		clock_gettime(CLOCK_MONOTONIC, &send_time);
 		pthread_mutex_lock(&mx_meas_dw);
 		meas_dw_pull_sent += 1;
@@ -1635,7 +1705,7 @@ void thread_down(void) {
 		while ((int)difftimespec(recv_time, send_time) < keepalive_time) {
 
 			/* try to receive a datagram */
-			msg_len = recv(sock_down, (void *)buff_down, (sizeof buff_down)-1, 0);
+			msg_len = recv(sock_down[ic], (void *)buff_down, (sizeof buff_down)-1, 0);
 			clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
 			/* if no network message was received, got back to listening sock_down socket */
@@ -1966,7 +2036,7 @@ void thread_down(void) {
 			}
 		}
 	}
-	MSG("\nINFO: End of downstream thread\n");
+	MSG("\nINFO: End of downstream thread for server  %i.\n",ic);
 }
 
 /* -------------------------------------------------------------------------- */
